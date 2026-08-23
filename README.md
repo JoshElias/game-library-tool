@@ -53,6 +53,7 @@ or `lineage_remote` in the config file. Do not commit credentials.
 ```bash
 game-library hosts
 game-library doctor
+game-library list --host example
 game-library registry list
 game-library status <slug> --host <name>
 game-library install <slug> --host <name>

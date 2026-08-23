@@ -8,5 +8,6 @@ fn help_exits_zero() {
         .success()
         .stdout(predicates::str::contains("registry"))
         .stdout(predicates::str::contains("uninstall"))
-        .stdout(predicates::str::contains("doctor"));
+        .stdout(predicates::str::contains("doctor"))
+        .stdout(predicates::str::contains("List live installs"));
 }

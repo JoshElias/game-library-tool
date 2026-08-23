@@ -14,6 +14,7 @@ pub mod hosts_file;
 pub mod install;
 pub mod inventory;
 pub mod legacy;
+pub mod library;
 pub mod paths;
 pub mod registry;
 pub mod ssh;
@@ -104,6 +105,13 @@ enum Command {
     Doctor {
         #[arg(long)]
         host: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List live installs and recipe coverage on a host
+    List {
+        #[arg(long)]
+        host: String,
         #[arg(long)]
         json: bool,
     },
@@ -248,6 +256,7 @@ where
         Command::Verify { slug, host } => verify_command(&slug, &host),
         Command::Uninstall { slug, host } => uninstall_command(&slug, &host),
         Command::Doctor { host, json } => doctor_command(host.as_deref(), json),
+        Command::List { host, json } => list_command(&host, json),
     }
 }
 
@@ -467,6 +476,24 @@ fn verify_command(slug: &str, host_name: &str) -> Result<(), Error> {
         );
         Err(Error::Message(String::new()))
     }
+}
+
+fn list_command(host_name: &str, json: bool) -> Result<(), Error> {
+    let host = load_host(host_name).map_err(|error| error.to_string())?;
+    let recipes = RegistryStore::new(RegistryStore::default_root())
+        .list()
+        .map_err(store_err)?;
+    let remote = connect(&host);
+    let rows = library::collect_library(&host, &recipes, remote.as_ref());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!("{}", library::format_rows(&host.name, &rows));
+    }
+    Ok(())
 }
 
 fn store_err(error: store::Error) -> Error {

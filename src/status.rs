@@ -220,6 +220,54 @@ pub fn extract_json_array(stdout: &str) -> Option<&str> {
     Some(&stdout[start..=end])
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LutrisInstalled {
+    pub id: Option<i64>,
+    pub slug: String,
+    pub name: String,
+    pub directory: Option<String>,
+    pub runner: Option<String>,
+}
+
+pub fn lutris_installed_games(remote: &dyn Remote) -> Vec<LutrisInstalled> {
+    let (code, stdout, _) = remote.run(&["lutris", "--list-games", "--installed", "--json"]);
+    if code != 0 || stdout.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(games) = serde_json::from_str::<Value>(extract_json_array(&stdout).unwrap_or(&stdout))
+    else {
+        return Vec::new();
+    };
+    let Some(games) = games.as_array() else {
+        return Vec::new();
+    };
+    games
+        .iter()
+        .map(|game| LutrisInstalled {
+            id: game.get("id").and_then(Value::as_i64),
+            slug: game
+                .get("slug")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            name: game
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            directory: game
+                .get("directory")
+                .or_else(|| game.get("directory_path"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            runner: game
+                .get("runner")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        })
+        .collect()
+}
+
 fn installed_identity(
     remote: &dyn Remote,
     recipe: &Recipe,

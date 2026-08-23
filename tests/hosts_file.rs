@@ -52,7 +52,7 @@ hosts:
 }
 
 #[test]
-fn hosts_env_file_wins_over_ansible() {
+fn hosts_env_file_is_used() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("hosts.yaml");
     fs::write(&path, EXAMPLE).unwrap();
