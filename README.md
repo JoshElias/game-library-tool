@@ -1,55 +1,88 @@
 # game-library
 
-A host-targeted operator for Lutris installs, SteamGridDB art, and
-Ludusavi save lineage. It is a CLI, not a desktop GUI and not Ansible.
+Keep **your** games and **your** saves in order across the PCs and
+handhelds you already own.
 
 [![ci](https://github.com/JoshElias/game-library-tool/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshElias/game-library-tool/actions/workflows/ci.yml)
 
-This tree does **not** ship anyone's store library, SSH keys, host
-inventory, or SteamGridDB pins. Bring your own hosts file and recipes.
+You point this CLI at machines you control. It installs an owned GOG
+title through Lutris (or enrolls a game that is already on disk), pins
+artwork, and wraps launch so a quit publishes an append-only save
+generation. The next machine restores that generation before play.
+Nothing here is Steam Cloud, Dropbox, or a shared account.
 
-## 30-second loop
+This repo does **not** ship your library, SSH keys, or store pins.
+Those stay on your machines.
+
+## What you get
+
+- One recipe per game: store ID, install path, art IDs, Ludusavi name
+- One hosts file for every device: desktop user, SSH, XDG game roots
+- `install` on a host: download if needed, wrap, enroll saves
+- `list` / `status`: what is actually installed and enrolled
+- `uninstall`: trash that game directory; keep the store record and
+  save lineage
+- After a normal quit, the wrap helper publishes a new generation.
+  The other enrolled host restores it on the next launch.
+
+Saves sync only under your private remote, beneath
+`Games/Game Saves/.lineage/`. Conflicts stay as branches. Nothing
+auto-picks a winner.
+
+## Set up once
+
+1. Install the CLI and the wrap helper on each device you play on.
+2. Copy `examples/hosts.yaml` to `~/.config/game-library/hosts.yaml`
+   and name your machines.
+3. Put your rclone remote name in
+   `~/.config/game-library/config.yaml` (see `examples/config.yaml`).
+   Do not commit that file if it points at real credentials.
+4. Add a recipe under `registry/games/` for each title you own.
+   Harvest IDs from your GOG/Lutris library and SteamGridDB; do not
+   invent them. `example-game.yaml` is a placeholder.
 
 ```bash
 git clone https://github.com/JoshElias/game-library-tool.git
 cd game-library-tool
-cargo test --locked
-cargo run -- hosts
-cargo run -- doctor
-```
-
-Rust 1.88 is pinned in `rust-toolchain.toml`. CI runs `fmt`, `clippy
--D warnings`, and `cargo test --locked`.
-
-## Install
-
-```bash
 cargo install --path . --locked --force
-```
-
-On each endpoint desktop user, install the lineage helper:
-
-```bash
 install -m 755 vendor/ludusavi-lutris-wrap ~/.local/bin/ludusavi-lutris-wrap
+mkdir -p ~/.config/game-library
+cp examples/hosts.yaml ~/.config/game-library/hosts.yaml
+cp examples/config.yaml ~/.config/game-library/config.yaml
 ```
 
-Do not commit rclone, Nextcloud, or SteamGridDB credentials.
+`~/.config/game-library/hosts.yaml` is found automatically.
 
-## Configure
-
-Copy the examples, then edit them:
+## Day to day
 
 ```bash
-mkdir -p ~/.config/game-library
-cp examples/config.yaml ~/.config/game-library/config.yaml
-cp examples/hosts.yaml ~/.config/game-library/hosts.yaml
+game-library hosts
+game-library doctor --host living-room
+game-library list --host living-room
+game-library install hades --host living-room    # waits for go
+game-library install hades --host steam-deck     # import the same lineage
+game-library status hades --host steam-deck
+game-library verify hades --host steam-deck
+game-library uninstall hades --host living-room  # waits for go; keeps saves
 ```
 
-`~/.config/game-library/hosts.yaml` is found automatically. You do not
-need `GAME_LIBRARY_HOSTS` unless the file lives somewhere else.
+Play from the Lutris or Steam tile the wrap already owns. Close the
+game normally so a generation can publish. A dead Lutris probe is
+usually SSH or no graphical session, not a missing install.
 
-Without a hosts file, `hosts` / `doctor` target this machine only
-(`ssh` alias `local`).
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `hosts` | Machines in your hosts file (or this machine only) |
+| `doctor` | Session, Lutris, Ludusavi, wrap helper, paths |
+| `list` | Live installs vs recipes, including unregistered Lutris titles |
+| `registry` | Add/show/remove pinned recipes |
+| `status` / `verify` | One game on one host |
+| `install` | Plan, then `go`: install, art, enroll, wrap |
+| `uninstall` | Plan, then `go`: trash files only |
+
+## Configuration
 
 | Need | Env | Then | Default |
 | --- | --- | --- | --- |
@@ -58,60 +91,20 @@ Without a hosts file, `hosts` / `doctor` target this machine only
 | Recipes | `GAME_LIBRARY_REGISTRY` | `$GAME_LIBRARY_REPO/registry/games` | `./registry/games` or XDG |
 | SSH | `GAME_LIBRARY_SSH` | `ssh_helper` in config | `ssh` |
 | Lineage remote | `GAME_LIBRARY_LINEAGE_REMOTE` | `lineage_remote` in config | `ludusavi` |
-| Shared GOG root | `GAME_LIBRARY_SHARED_GOG` | `shared_gog_root` in config | unset (no redirect check) |
+| Shared GOG root | `GAME_LIBRARY_SHARED_GOG` | `shared_gog_root` in config | unset |
 
-`registry/games/example-game.yaml` is a non-installable placeholder.
-
-## Commands
+## Develop
 
 ```bash
-game-library hosts
-game-library doctor                 # or: --host <name>
-game-library list --host <name>
-game-library registry list
-game-library status <slug> --host <name>
-game-library install <slug> --host <name>
-game-library verify <slug> --host <name>
-game-library uninstall <slug> --host <name>
-```
-
-`install` and `uninstall` print a plan and wait for `go`. An empty
-Lutris/wrap probe is usually SSH or a missing graphical session, not a
-missing game.
-
-## Hack on it
-
-```bash
+cargo test --locked
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
-cargo test --locked
-cargo run -- list --host "$(hostname)"
+cargo run -- hosts
 ```
 
-Layout:
-
-| Path | Role |
-| --- | --- |
-| `src/` | Rust CLI (clap). Orchestrates; does not speak Gtk. |
-| `scripts/` | Endpoint Python. Lutris DB/Steam helpers and artwork. |
-| `vendor/ludusavi-lutris-wrap` | Lineage helper installed on each desktop user. |
-| `registry/games/` | Pinned recipes (yours, not this repo's). |
-| `examples/` | Sample `hosts.yaml` and `config.yaml`. |
-| `.github/workflows/ci.yml` | fmt + clippy + test. |
-
-Rust decides what to run and when. Python stays because Lutris's
-mutation API is Python, artwork uses Pillow, and the wrap helper is the
-proven lineage protocol.
-
-Pin a recipe before `install`. Harvest store IDs and SteamGridDB art IDs
-from a live library; do not invent them.
-
-## What stays out of this repo
-
-- Production inventories, IPs, and SSH aliases
-- Personal GOG/Steam recipes and SteamGridDB art IDs
-- rclone / Nextcloud / SteamGridDB key files
-- Endpoint Wine prefixes and save archives
+Rust 1.88 is pinned in `rust-toolchain.toml`. The CLI orchestrates.
+Endpoint Python (`scripts/`, `vendor/ludusavi-lutris-wrap`) talks to
+Lutris, Pillow, Ludusavi, and rclone.
 
 ## License
 
