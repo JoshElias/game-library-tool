@@ -3,6 +3,8 @@
 A host-targeted operator for Lutris installs, SteamGridDB art, and
 Ludusavi save lineage. It is a CLI, not a desktop GUI and not Ansible.
 
+[![ci](https://github.com/JoshElias/game-library-tool/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshElias/game-library-tool/actions/workflows/ci.yml)
+
 This public tree does **not** include anyone's store library, SSH keys,
 host inventory, or SteamGridDB pins. Bring your own hosts file and
 recipes.
@@ -10,8 +12,8 @@ recipes.
 ## Install
 
 ```bash
-git clone <this-repo>
-cd game-library
+git clone https://github.com/JoshElias/game-library-tool.git
+cd game-library-tool
 cargo install --path . --locked --force
 ```
 
