@@ -54,12 +54,7 @@ impl InventoryLoader for AnsibleInventory {
     fn load(&self, args: &[&str]) -> Result<Value, Error> {
         let output = Command::new("ansible-inventory")
             .current_dir(&self.repo_root)
-            .args([
-                "-i",
-                "inventory/daemon-fleet.yml",
-                "-i",
-                "inventory/hosts.yml",
-            ])
+            .args(["-i", "inventory/hosts.yml"])
             .args(args)
             .output()
             .map_err(|error| Error::Message(error.to_string()))?;
