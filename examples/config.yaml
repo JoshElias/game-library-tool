@@ -1,0 +1,8 @@
+# Optional operator config. Environment variables win over this file.
+# GAME_LIBRARY_CONFIG, GAME_LIBRARY_HOSTS, GAME_LIBRARY_SSH,
+# GAME_LIBRARY_LINEAGE_REMOTE, GAME_LIBRARY_SHARED_GOG
+
+ssh_helper: ssh
+hosts: /home/alice/.config/game-library/hosts.yaml
+lineage_remote: ludusavi
+# shared_gog_root: /home/shared/.local/share/games/gog

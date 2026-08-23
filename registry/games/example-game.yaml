@@ -1,0 +1,31 @@
+slug: example-game
+title: Example Game
+source: gog
+installable: false
+product_id: "0"
+lutris:
+  installer_id: ""
+  installer_slug: ""
+  runner: wine
+  proton: ge-latest
+  existing_only: true
+  directory_template: "{{ gaming_workstations_gog_library_root }}/example-game"
+steam_shortcut: false
+steamgriddb:
+  game_id: 0
+  landscape_id: 0
+  capsule_id: 0
+  hero_id: 0
+  logo_id: 0
+  icon_id: 0
+ludusavi:
+  name: Example Game
+  game_key: ""
+  custom_games: []
+  registry_portability_proven: false
+lineage:
+  import_root: null
+  import_generation: null
+notes:
+  - Placeholder recipe. Replace IDs from your own store library and SteamGridDB.
+  - installable stays false until every required pin is present.

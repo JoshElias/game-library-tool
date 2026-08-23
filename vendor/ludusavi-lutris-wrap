@@ -1,0 +1,1280 @@
+#!/usr/bin/env python3
+"""Exact-game, append-only Ludusavi lineage wrapper (standard library only).
+
+The helper never invokes Ludusavi cloud commands or mutable rclone operations.
+Remote and standalone-backup use is gated by enrollment canaries.
+The invoking desktop UID is trusted; hostile same-UID isolation is out of scope.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+from pathlib import Path, PurePosixPath
+import re
+import signal
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from typing import Any, Iterable, Mapping, Sequence
+import uuid
+
+PROTOCOL = "game-library-ludusavi-lineage"
+SCHEMA = 1
+REMOTE_ROOT = "Games/Game Saves/.lineage/v1"
+HELPER_VERSION = 1
+TERM_GRACE_SECONDS = 10.0
+KILL_GRACE_SECONDS = 10.0
+MAX_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
+MAX_MEMBERS = 100_000
+UUID4_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+class SafetyError(RuntimeError): pass
+class UsageError(SafetyError): pass
+class LockBusy(SafetyError): pass
+class DivergenceError(SafetyError): pass
+class LiveStateDiffers(SafetyError): pass
+
+@dataclasses.dataclass(frozen=True)
+class CommandResult:
+    argv: tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+
+def run_command(argv: Sequence[str], *, capture: bool = True, pass_fds: Sequence[int] = ()) -> CommandResult:
+    if not argv or any("\x00" in x for x in argv):
+        raise SafetyError("invalid command vector")
+    p = subprocess.run(list(argv), check=False, text=True, capture_output=capture, shell=False,
+                       pass_fds=tuple(pass_fds))
+    return CommandResult(tuple(argv), p.returncode, p.stdout or "", p.stderr or "")
+
+def validate_game(name: str) -> str:
+    if not name or name.strip() != name or "\x00" in name or "\n" in name or "\r" in name:
+        raise UsageError("invalid exact game name")
+    return name
+
+def game_key(name: str) -> str:
+    return hashlib.sha256(validate_game(name).encode("utf-8")).hexdigest()
+
+def _lstat_private_directory(path: Path, uid: int) -> None:
+    try: st=os.lstat(path)
+    except OSError as exc: raise SafetyError("unsafe private path") from exc
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != uid or stat.S_IMODE(st.st_mode)&0o022:
+        raise SafetyError("untrusted private path owner or mode")
+
+def _private_dir(path: Path) -> None:
+    """Create only missing leaves; never repair an existing untrusted path."""
+    path=path.absolute(); missing=[]; current=path
+    while True:
+        try: os.lstat(current); break
+        except FileNotFoundError:
+            missing.append(current)
+            if current.parent==current: raise SafetyError("no trusted path ancestor")
+            current=current.parent
+    uid=os.geteuid(); _lstat_private_directory(current,uid)
+    for item in reversed(missing):
+        try: os.mkdir(item,0o700)
+        except FileExistsError: pass
+        _lstat_private_directory(item,uid)
+
+def _state_base(env: Mapping[str,str] | None=None) -> Path:
+    e=os.environ if env is None else env
+    try: home=Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except (KeyError,TypeError) as exc: raise SafetyError("passwd home unavailable") from exc
+    raw=e.get("XDG_STATE_HOME") or str(home/".local/state")
+    base=Path(raw)
+    if not base.is_absolute(): raise SafetyError("state home must be absolute")
+    try: relative=base.relative_to(home)
+    except ValueError as exc: raise SafetyError("state home escapes passwd home") from exc
+    uid=os.geteuid(); _lstat_private_directory(home,uid)
+    current=home
+    for component in relative.parts:
+        current=current/component
+        try: os.lstat(current)
+        except FileNotFoundError: break
+        _lstat_private_directory(current,uid)
+    _private_dir(base)
+    current=home
+    for component in relative.parts:
+        current=current/component; _lstat_private_directory(current,uid)
+    return base
+
+def state_root(name: str, env: Mapping[str,str] | None=None) -> Path:
+    base=_state_base(env); root=base/"game-library/save-lineage"/game_key(name); _private_dir(root)
+    current=base
+    for component in root.relative_to(base).parts:
+        current=current/component; _lstat_private_directory(current,os.geteuid())
+    return root
+
+def atomic_json(path: Path, value: Mapping[str,Any], *, fail_at: str | None=None) -> None:
+    _private_dir(path.parent)
+    if path.is_symlink(): raise SafetyError("metadata file is a symlink")
+    data=(json.dumps(value, sort_keys=True, separators=(",", ":"))+"\n").encode()
+    fd,tmp=tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+    try:
+        os.fchmod(fd,0o600); os.write(fd,data); os.fsync(fd)
+        if fail_at=="before_replace": raise OSError("injected failure")
+        os.close(fd); fd=-1; os.replace(tmp,path)
+        dfd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+        if fail_at=="after_replace": raise OSError("injected failure")
+    finally:
+        if fd >= 0: os.close(fd)
+        with contextlib.suppress(FileNotFoundError): os.unlink(tmp)
+
+def load_json(path: Path) -> dict[str,Any]:
+    try:
+        st=os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or stat.S_IMODE(st.st_mode)!=0o600:
+            raise SafetyError("unsafe or missing metadata")
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+        try:
+            opened=os.fstat(fd)
+            if (opened.st_dev,opened.st_ino)!=(st.st_dev,st.st_ino): raise SafetyError("metadata changed during open")
+            data=os.read(fd,1024*1024+1)
+            if len(data)>1024*1024: raise SafetyError("metadata too large")
+        finally: os.close(fd)
+        value=json.loads(data.decode("utf-8"))
+    except (OSError,UnicodeError,json.JSONDecodeError) as e: raise SafetyError("invalid metadata") from e
+    if not isinstance(value,dict): raise SafetyError("invalid metadata")
+    return value
+
+def _validate_runtime_dir(path: Path) -> None:
+    """Validate the complete existing runtime path without repairing any part."""
+    if not path.is_absolute(): raise SafetyError("runtime directory must be absolute")
+    uid=os.geteuid(); current=Path(path.anchor)
+    anchor=os.lstat(current)
+    if stat.S_ISLNK(anchor.st_mode) or not stat.S_ISDIR(anchor.st_mode) or anchor.st_uid not in {0,uid} or stat.S_IMODE(anchor.st_mode)&0o022:
+        raise SafetyError("untrusted runtime path owner or mode")
+    for component in path.parts[1:]:
+        current=current/component
+        try: st=os.lstat(current)
+        except OSError as exc: raise SafetyError("unsafe runtime path") from exc
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode): raise SafetyError("unsafe runtime path")
+        if st.st_uid not in {0,uid} or stat.S_IMODE(st.st_mode)&0o022: raise SafetyError("untrusted runtime path owner or mode")
+    st=os.lstat(path)
+    if st.st_uid!=uid: raise SafetyError("runtime directory has unexpected owner")
+
+@contextlib.contextmanager
+def game_lock(name: str, env: Mapping[str,str] | None=None):
+    e=os.environ if env is None else env
+    runtime=e.get("XDG_RUNTIME_DIR")
+    if not runtime: raise SafetyError("XDG_RUNTIME_DIR unavailable")
+    runtime_path=Path(runtime); _validate_runtime_dir(runtime_path)
+    root=runtime_path/"game-library-save-lineage"; _private_dir(root)
+    path=root/(game_key(name)+".lock")
+    if path.is_symlink(): raise SafetyError("lock is a symlink")
+    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError as e: raise LockBusy("game already active") from e
+        yield fd
+    finally: os.close(fd)
+
+def canonical_uuid(value: Any, *, nullable=False) -> str|None:
+    if value is None and nullable: return None
+    if not isinstance(value,str) or not UUID4_RE.fullmatch(value): raise SafetyError("invalid generation id")
+    if str(uuid.UUID(value)) != value: raise SafetyError("noncanonical generation id")
+    return value
+
+def utc_timestamp(value: Any) -> str:
+    if not isinstance(value,str) or not value.endswith("Z"): raise SafetyError("invalid timestamp")
+    try: parsed=dt.datetime.fromisoformat(value[:-1]+"+00:00")
+    except ValueError as e: raise SafetyError("invalid timestamp") from e
+    if parsed.tzinfo != dt.timezone.utc: raise SafetyError("invalid timestamp")
+    return value
+
+def validate_manifest(raw: Mapping[str,Any], directory_id: str, expected_game: str) -> dict[str,Any]:
+    required={"schema","protocol","game","generation","payload"}
+    if not isinstance(raw,Mapping) or set(raw)!=required or raw.get("schema")!=SCHEMA or raw.get("protocol")!=PROTOCOL: raise SafetyError("invalid manifest envelope")
+    g=raw["game"]; gen=raw["generation"]; pay=raw["payload"]
+    if not isinstance(g,Mapping) or set(g)!={"canonicalName","keySha256"}: raise SafetyError("invalid game manifest")
+    if g["canonicalName"]!=expected_game or g["keySha256"]!=game_key(expected_game): raise SafetyError("wrong exact game")
+    if not isinstance(gen,Mapping) or set(gen)!={"id","parent","createdUtc","creatorHostId","reason"}: raise SafetyError("invalid generation")
+    ident=canonical_uuid(gen["id"]); canonical_uuid(directory_id)
+    if ident!=directory_id: raise SafetyError("generation directory mismatch")
+    parent=canonical_uuid(gen["parent"],nullable=True)
+    if parent==ident: raise SafetyError("self parent")
+    utc_timestamp(gen["createdUtc"])
+    if not isinstance(gen["creatorHostId"],str) or not gen["creatorHostId"] or len(gen["creatorHostId"])>128: raise SafetyError("invalid host id")
+    if gen["reason"] not in {"enrollment","normal-exit","crash-recovery"}: raise SafetyError("invalid reason")
+    if not isinstance(pay,Mapping) or set(pay)!={"object","bytes","sha256","format","ludusaviVersion","backupId"}: raise SafetyError("invalid payload")
+    if pay["object"]!="payload.tar" or pay["format"]!="tar": raise SafetyError("invalid payload format")
+    if type(pay["bytes"]) is not int or not 0 <= pay["bytes"] <= MAX_PAYLOAD_BYTES: raise SafetyError("invalid payload size")
+    if not isinstance(pay["sha256"],str) or not HEX_RE.fullmatch(pay["sha256"]): raise SafetyError("invalid payload hash")
+    if not all(isinstance(pay[x],str) and pay[x] for x in ("ludusaviVersion","backupId")): raise SafetyError("invalid payload metadata")
+    return dict(raw)
+
+def classify_lineage(manifests: Mapping[str,Mapping[str,Any]], local: str, game: str) -> str|None:
+    canonical_uuid(local)
+    valid={k:validate_manifest(v,k,game) for k,v in manifests.items()}
+    if local not in valid: raise SafetyError("local generation absent remotely")
+    roots=[k for k,v in valid.items() if v["generation"]["parent"] is None]
+    if len(roots)!=1: raise DivergenceError("unrelated root or branch")
+    children={k:[] for k in valid}
+    for k,v in valid.items():
+        p=v["generation"]["parent"]
+        if p is not None:
+            if p not in valid: raise SafetyError("missing ancestor")
+            children[p].append(k)
+    # Entire graph must be one chain; this also detects branches and unrelated descendants.
+    seen=set(); cur=roots[0]
+    while True:
+        if cur in seen: raise SafetyError("cycle")
+        seen.add(cur)
+        if len(children[cur])>1: raise DivergenceError("divergent lineage")
+        if not children[cur]: break
+        cur=children[cur][0]
+    if seen != set(valid): raise DivergenceError("unrelated lineage")
+    # local must lie on chain; tip is unique descendant or no-op.
+    return None if cur==local else cur
+
+def _regular_snapshot(fd: int, expected_bytes: int | None=None, *, maximum: int=MAX_PAYLOAD_BYTES) -> os.stat_result:
+    st=os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode): raise SafetyError("payload is not regular")
+    if expected_bytes is not None and st.st_size!=expected_bytes: raise SafetyError("payload size mismatch")
+    if st.st_size>maximum: raise SafetyError("payload too large")
+    return st
+
+
+def _read_fd(fd: int, maximum: int) -> bytes:
+    os.lseek(fd,0,os.SEEK_SET); chunks=[]; total=0
+    while True:
+        chunk=os.read(fd,min(1024*1024,maximum+1-total))
+        if not chunk: break
+        chunks.append(chunk); total+=len(chunk)
+        if total>maximum: raise SafetyError("file too large")
+    os.lseek(fd,0,os.SEEK_SET)
+    return b"".join(chunks)
+
+
+def sha256_fd(fd: int, expected_bytes: int | None=None, *, maximum: int=MAX_PAYLOAD_BYTES) -> str:
+    before=_regular_snapshot(fd,expected_bytes,maximum=maximum); os.lseek(fd,0,os.SEEK_SET); h=hashlib.sha256()
+    while True:
+        chunk=os.read(fd,1024*1024)
+        if not chunk: break
+        h.update(chunk)
+    after=os.fstat(fd)
+    if (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns):
+        raise SafetyError("payload changed during verification")
+    os.lseek(fd,0,os.SEEK_SET)
+    return h.hexdigest()
+
+
+@contextlib.contextmanager
+def open_verified_file(path: Path, expected_bytes: int | None=None, expected_sha256: str | None=None,
+                       *, maximum: int=MAX_PAYLOAD_BYTES):
+    try: fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+    except OSError as exc: raise SafetyError("payload is not regular") from exc
+    try:
+        before=_regular_snapshot(fd,expected_bytes,maximum=maximum)
+        digest=sha256_fd(fd,expected_bytes,maximum=maximum)
+        if expected_sha256 is not None and digest!=expected_sha256: raise SafetyError("payload hash mismatch")
+        yield fd
+        after=os.fstat(fd)
+        if (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns):
+            raise SafetyError("payload changed while in use")
+    finally: os.close(fd)
+
+
+def sha256_file(path: Path, expected_bytes: int|None=None) -> str:
+    with open_verified_file(path,expected_bytes) as fd: return sha256_fd(fd,expected_bytes)
+
+
+def _open_directory_chain(rootfd: int, parts: Sequence[str]) -> int:
+    current=os.dup(rootfd)
+    try:
+        for name in parts:
+            if not name or name in {".",".."} or "/" in name: raise SafetyError("unsafe archive destination")
+            try: os.mkdir(name,0o700,dir_fd=current)
+            except FileExistsError: pass
+            try: child=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=current)
+            except OSError as exc: raise SafetyError("unsafe archive destination") from exc
+            os.close(current); current=child
+        return current
+    except BaseException:
+        os.close(current); raise
+
+
+def safe_extract_tar_fd(archive_fd: int, destination: Path, *, max_members=MAX_MEMBERS, max_expanded=MAX_EXPANDED_BYTES) -> None:
+    _private_dir(destination)
+    try: rootfd=os.open(destination,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    except OSError as exc: raise SafetyError("unsafe archive destination") from exc
+    seen:set[str]=set(); total=0
+    try:
+        os.lseek(archive_fd,0,os.SEEK_SET)
+        with os.fdopen(os.dup(archive_fd),"rb") as stream, tarfile.open(fileobj=stream,mode="r:") as tf:
+            members=tf.getmembers()
+            if len(members)>max_members: raise SafetyError("too many archive members")
+            for m in members:
+                p=PurePosixPath(m.name)
+                if not m.name or p.is_absolute() or ".." in p.parts or m.issym() or m.islnk() or not (m.isfile() or m.isdir()): raise SafetyError("unsafe archive member")
+                normalized=p.as_posix().rstrip("/")
+                if normalized in seen: raise SafetyError("duplicate archive member")
+                seen.add(normalized)
+                if m.uid!=0 or m.gid!=0 or m.mode & ~0o755 or (m.isfile() and m.mode & 0o111): raise SafetyError("unsafe archive metadata")
+                total+=m.size
+                if total>max_expanded: raise SafetyError("archive expansion limit")
+            for m in members:
+                parts=PurePosixPath(m.name).parts
+                if m.isdir():
+                    directory=_open_directory_chain(rootfd,parts); os.close(directory); continue
+                parent=_open_directory_chain(rootfd,parts[:-1])
+                try:
+                    try: outfd=os.open(parts[-1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+                    except OSError as exc: raise SafetyError("unsafe archive destination") from exc
+                    try:
+                        src=tf.extractfile(m)
+                        if src is None: raise SafetyError("missing archive data")
+                        while True:
+                            chunk=src.read(1024*1024)
+                            if not chunk: break
+                            view=memoryview(chunk)
+                            while view: view=view[os.write(outfd,view):]
+                        os.fchmod(outfd,0o600)
+                    finally: os.close(outfd)
+                finally: os.close(parent)
+        os.lseek(archive_fd,0,os.SEEK_SET)
+    finally: os.close(rootfd)
+
+
+def safe_extract_tar(archive: Path, destination: Path, *, max_members=MAX_MEMBERS, max_expanded=MAX_EXPANDED_BYTES) -> None:
+    with open_verified_file(archive) as fd:
+        safe_extract_tar_fd(fd,destination,max_members=max_members,max_expanded=max_expanded)
+
+def _api_errors(value: Any) -> None:
+    if value is None: return
+    if not isinstance(value,Mapping) or value: raise SafetyError("ludusavi API reported errors")
+
+def _save_error(value: Any) -> None:
+    if not isinstance(value,Mapping) or set(value)!={"message"} or not isinstance(value["message"],str):
+        raise SafetyError("invalid save error")
+    raise SafetyError("ludusavi entry failed")
+
+
+def _operative_entry(value: Any, kind: str, *, exact_same: bool) -> bool:
+    allowed={
+        "file":{"failed","error","ignored","change","bytes","originalPath","redirectedPath","duplicatedBy"},
+        "registry":{"failed","error","ignored","change","duplicatedBy","values"},
+        "value":{"ignored","change","duplicatedBy"},
+    }[kind]
+    if not isinstance(value,Mapping) or set(value)-allowed: raise SafetyError("invalid preview entry")
+    if "failed" in value and type(value["failed"]) is not bool: raise SafetyError("invalid preview entry")
+    if "ignored" in value and type(value["ignored"]) is not bool: raise SafetyError("invalid preview entry")
+    if value.get("failed",False) or value.get("ignored",False): raise SafetyError("failed or ignored preview entry")
+    if "error" in value: _save_error(value["error"])
+    changes={"New","Different","Removed","Same"}; change=value.get("change")
+    if change not in changes: raise SafetyError("invalid preview change")
+    differs=change!="Same"
+    if "duplicatedBy" in value:
+        dup=value["duplicatedBy"]
+        if not isinstance(dup,list) or any(not isinstance(x,str) for x in dup) or len(dup)!=len(set(dup)):
+            raise SafetyError("invalid preview entry")
+    if kind=="file":
+        if type(value.get("bytes")) is not int or value["bytes"]<0: raise SafetyError("invalid preview entry")
+        for field in ("originalPath","redirectedPath"):
+            if field in value and not isinstance(value[field],str): raise SafetyError("invalid preview entry")
+    if kind=="registry" and "values" in value:
+        values=value["values"]
+        if not isinstance(values,Mapping): raise SafetyError("invalid preview entry")
+        differs=any(_operative_entry(item,"value",exact_same=exact_same) for item in values.values()) or differs
+    return differs
+
+
+def _operation_status(value: Any) -> Mapping[str,Any]:
+    fields={"totalGames","totalBytes","processedGames","processedBytes","changedGames"}
+    if not isinstance(value,Mapping) or set(value)!=fields: raise SafetyError("invalid operation status")
+    for field in fields-{"changedGames"}:
+        if type(value[field]) is not int or value[field]<0: raise SafetyError("invalid operation status")
+    changed=value["changedGames"]
+    if not isinstance(changed,Mapping) or set(changed)!={"new","different","same"}: raise SafetyError("invalid operation status")
+    if any(type(v) is not int or v<0 for v in changed.values()): raise SafetyError("invalid operation status")
+    if value["processedGames"]>value["totalGames"] or value["processedBytes"]>value["totalBytes"]:
+        raise SafetyError("inconsistent operation status")
+    return value
+
+
+def _validate_operative(api: Mapping[str,Any], game: str, *, exact_same: bool, registry_portability_proven: bool) -> None:
+    try:
+        if not isinstance(api,Mapping) or set(api)-{"games","errors","overall","cloud"} or "overall" not in api:
+            raise SafetyError("invalid preview")
+        _api_errors(api.get("errors")); status=_operation_status(api["overall"])
+        if "cloud" in api and (not isinstance(api["cloud"],Mapping) or api["cloud"]): raise SafetyError("unexpected cloud output")
+        games=api.get("games")
+        if not isinstance(games,Mapping) or set(games)!={game}: raise SafetyError("wrong preview game")
+        record=games[game]
+        if not isinstance(record,Mapping) or set(record)-{"decision","change","files","registry","dump"}: raise SafetyError("invalid preview")
+        if record.get("decision")!="Processed": raise SafetyError("preview not processed")
+        changes={"New","Different","Removed","Same"}; change=record.get("change")
+        if change not in changes: raise SafetyError("invalid preview change")
+        expected_changed={"new":0,"different":0,"same":0}
+        if change=="New": expected_changed["new"]=1
+        elif change=="Different": expected_changed["different"]=1
+        elif change=="Same": expected_changed["same"]=1
+        if status["totalGames"]!=1 or status["processedGames"]!=1 or status["changedGames"]!=expected_changed:
+            raise SafetyError("operation status contradicts exact processed game")
+        differs=change!="Same"
+        files,registry=record.get("files"),record.get("registry")
+        if not isinstance(files,Mapping) or not isinstance(registry,Mapping): raise SafetyError("invalid preview entries")
+        differs=any(_operative_entry(item,"file",exact_same=exact_same) for item in files.values()) or differs
+        differs=any(_operative_entry(item,"registry",exact_same=exact_same) for item in registry.values()) or differs
+        dump=record.get("dump",{})
+        if not isinstance(dump,Mapping) or set(dump)-{"registry"} or ("registry" in dump and not isinstance(dump["registry"],str)):
+            raise SafetyError("unexpected registry dump")
+        if registry and not registry_portability_proven: raise SafetyError("registry portability not enrolled")
+        if exact_same and differs: raise LiveStateDiffers("live state differs")
+    except (AttributeError,KeyError,TypeError,ValueError) as exc:
+        raise SafetyError("malformed preview") from exc
+
+
+def require_exact_same(api: Mapping[str,Any], game: str, *, registry_portability_proven=False) -> None:
+    _validate_operative(api,game,exact_same=True,registry_portability_proven=registry_portability_proven)
+
+def validate_restore_preview(api: Mapping[str,Any], game:str, *, registry_portability_proven=False) -> None:
+    _validate_operative(api,game,exact_same=False,registry_portability_proven=registry_portability_proven)
+
+def ludusavi_compare_argv(exe:str, path:Path, game:str)->list[str]:
+    return [exe,"--no-manifest-update","backup","--preview","--path",str(path),"--api",validate_game(game)]
+def ludusavi_backup_argv(exe:str,path:Path,game:str)->list[str]:
+    return [exe,"--no-manifest-update","backup","--force","--no-cloud-sync","--path",str(path),"--format","zip","--full-limit","1","--differential-limit","0","--api",validate_game(game)]
+def ludusavi_restore_argv(exe:str,path:Path,backup_id:str,game:str,*,preview=False)->list[str]:
+    a=[exe,"--no-manifest-update","restore"]
+    if preview:a.append("--preview")
+    else:a += ["--force","--no-cloud-sync"]
+    return a+["--path",str(path),"--backup",backup_id,"--api",validate_game(game)]
+def rclone_copyto_argv(exe:str,source:str,destination:str)->list[str]: return [exe,"copyto","--immutable",source,destination]
+def remote_generation(remote:str,key:str,ident:str)->str:
+    if not remote or ":" in remote or "/" in remote or any(ord(c)<32 or ord(c)==127 for c in remote): raise SafetyError("invalid remote name")
+    canonical_uuid(ident)
+    return f"{remote}:{REMOTE_ROOT}/games/{key}/generations/{ident}"
+
+def _host_identity() -> dict[str,str]:
+    hostname=socket.gethostname()
+    if not hostname or any(ord(c)<33 or ord(c)==127 for c in hostname): raise SafetyError("invalid local hostname")
+    machine=None
+    for candidate in (Path("/etc/machine-id"),Path("/var/lib/dbus/machine-id")):
+        try: value=candidate.read_text(encoding="ascii").strip()
+        except OSError: continue
+        if re.fullmatch(r"[0-9a-fA-F]{32}",value): machine=value.lower(); break
+    if machine is None: raise SafetyError("machine-id unavailable")
+    return {"hostname":hostname,"id":hashlib.sha256((hostname+"\0"+machine).encode()).hexdigest()}
+
+def _validate_canary(raw: Mapping[str,Any], remote: str, game: str, *, fresh: bool) -> dict[str,Any]:
+    fields={"schema","protocol","helperVersion","game","gameKey","hostIdentity","remote","observedUtc","canaryObject","canarySha256","backupId","backupSha256"}
+    if not isinstance(raw,Mapping) or set(raw)!=fields or raw.get("schema")!=2 or raw.get("protocol")!=PROTOCOL or raw.get("helperVersion")!=HELPER_VERSION or raw.get("game")!=game or raw.get("gameKey")!=game_key(game) or raw.get("remote")!=remote:
+        raise SafetyError("invalid canary evidence")
+    host=raw.get("hostIdentity")
+    if host!=_host_identity(): raise SafetyError("canary evidence belongs to another host")
+    observed=utc_timestamp(raw["observedUtc"])
+    parsed=dt.datetime.fromisoformat(observed[:-1]+"+00:00")
+    now=dt.datetime.now(dt.timezone.utc)
+    if parsed>now+dt.timedelta(minutes=5) or (fresh and now-parsed>dt.timedelta(hours=24)): raise SafetyError("stale canary evidence")
+    obj=raw["canaryObject"]
+    expected=f"{remote}:{REMOTE_ROOT}/canaries/{host['id']}/"
+    if not isinstance(obj,str) or not obj.startswith(expected) or not UUID4_RE.fullmatch(obj.removeprefix(expected)): raise SafetyError("invalid canary object")
+    if not isinstance(raw["canarySha256"],str) or not HEX_RE.fullmatch(raw["canarySha256"]): raise SafetyError("invalid canary hash")
+    if not isinstance(raw["backupSha256"],str) or not HEX_RE.fullmatch(raw["backupSha256"]): raise SafetyError("invalid canary backup hash")
+    if not isinstance(raw["backupId"],str) or not raw["backupId"]: raise SafetyError("invalid canary backup id")
+    return dict(raw)
+
+def _canary(path: Path, remote: str, game: str) -> dict[str,Any]:
+    expected=state_root(game)/"canary.json"
+    if path.absolute()!=expected.absolute(): raise SafetyError("canary evidence is not helper-managed")
+    return _validate_canary(load_json(path),remote,game,fresh=True)
+
+def _load_canary_restore(root: Path, ns: argparse.Namespace) -> dict[str,Any] | None:
+    path=root/"canary-restore.json"
+    if not path.exists(): return None
+    raw=load_json(path)
+    fields={"schema","protocol","game","gameKey","remote","hostIdentity","canaryObject","canarySha256","rollbackGeneration","rollbackBackupId","rollbackSha256","registryPortabilityProven","phase"}
+    if not isinstance(raw,Mapping) or set(raw)!=fields or raw.get("schema")!=1 or raw.get("protocol")!=PROTOCOL or raw.get("game")!=ns.name or raw.get("gameKey")!=game_key(ns.name) or raw.get("remote")!=ns.remote or raw.get("hostIdentity")!=_host_identity() or raw.get("registryPortabilityProven")!=ns.registry_portability_proven or raw.get("phase") not in {"prepared","applied"}:
+        raise SafetyError("canary restore journal invocation mismatch")
+    ident=canonical_uuid(raw["rollbackGeneration"])
+    if not isinstance(raw["rollbackBackupId"],str) or not raw["rollbackBackupId"] or not isinstance(raw["rollbackSha256"],str) or not HEX_RE.fullmatch(raw["rollbackSha256"]): raise SafetyError("invalid canary rollback")
+    if not isinstance(raw["canarySha256"],str) or not HEX_RE.fullmatch(raw["canarySha256"]): raise SafetyError("invalid canary journal")
+    expected=f"{ns.remote}:{REMOTE_ROOT}/canaries/{raw['hostIdentity']['id']}/"
+    if not isinstance(raw["canaryObject"],str) or not raw["canaryObject"].startswith(expected) or not UUID4_RE.fullmatch(raw["canaryObject"].removeprefix(expected)): raise SafetyError("invalid canary journal")
+    rollback=root/"canary-rollback"/ident
+    manifest=validate_manifest(load_json(rollback/"manifest.json"),ident,ns.name)
+    if manifest["generation"]["parent"] is not None or manifest["payload"]["backupId"]!=raw["rollbackBackupId"] or manifest["payload"]["sha256"]!=raw["rollbackSha256"]:
+        raise SafetyError("canary rollback manifest mismatch")
+    if sha256_file(rollback/"payload.tar",manifest["payload"]["bytes"])!=raw["rollbackSha256"]: raise SafetyError("canary rollback payload invalid")
+    return dict(raw)
+
+
+def _canary_evidence(journal: Mapping[str,Any]) -> dict[str,Any]:
+    return {"schema":2,"protocol":PROTOCOL,"helperVersion":HELPER_VERSION,"game":journal["game"],"gameKey":journal["gameKey"],"hostIdentity":dict(journal["hostIdentity"]),"remote":journal["remote"],
+            "observedUtc":dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z"),"canaryObject":journal["canaryObject"],
+            "canarySha256":journal["canarySha256"],"backupId":journal["rollbackBackupId"],"backupSha256":journal["rollbackSha256"]}
+
+
+def _resume_canary(root: Path, ns: argparse.Namespace, journal: Mapping[str,Any]) -> dict[str,Any]:
+    rollback=root/"canary-rollback"/journal["rollbackGeneration"]; payload=rollback/"payload-root"
+    if _backups_id(ns.ludusavi,payload,ns.name)!=journal["rollbackBackupId"]: raise SafetyError("canary rollback backup id mismatch")
+    fetched_dir=root/"canary-work"/journal["rollbackGeneration"]
+    with _download_to_fd(ns.rclone,journal["canaryObject"],fetched_dir) as fetched_fd:
+        if sha256_fd(fetched_fd)!=journal["canarySha256"]: raise SafetyError("canary object changed")
+    already_applied=journal["phase"]=="applied" and _compare(ns.ludusavi,payload,ns.name,ns.registry_portability_proven)
+    if not already_applied:
+        _require_live_matches(ns.ludusavi,payload,ns.name,ns.registry_portability_proven,reason="live state changed before canary restore")
+        validate_restore_preview(_api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,journal["rollbackBackupId"],ns.name,preview=True))),ns.name,registry_portability_proven=ns.registry_portability_proven)
+        _require_live_matches(ns.ludusavi,payload,ns.name,ns.registry_portability_proven,reason="live state changed before canary restore")
+        _api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,journal["rollbackBackupId"],ns.name)))
+        updated=dict(journal); updated["phase"]="applied"; atomic_json(root/"canary-restore.json",updated)
+        require_exact_same(_api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,journal["rollbackBackupId"],ns.name,preview=True))),ns.name,registry_portability_proven=ns.registry_portability_proven)
+    evidence=_canary_evidence(journal)
+    atomic_json(root/"canary.json",evidence); _durable_unlink(root/"canary-restore.json")
+    return evidence
+
+
+def perform_canary(ns: argparse.Namespace) -> None:
+    root=state_root(ns.name); _private_dir(root); _remote_exists(ns.rclone,ns.remote)
+    journal=_load_canary_restore(root,ns)
+    if journal is None:
+        host=_host_identity(); ident=str(uuid.uuid4()); remote_object=f"{ns.remote}:{REMOTE_ROOT}/canaries/{host['id']}/{ident}"
+        stage=root/"canary-work"/ident; _private_dir(stage)
+        original=stage/"original"; changed=stage/"changed"; fetched=stage/"fetched"
+        original.write_bytes(os.urandom(64)); changed.write_bytes(os.urandom(64)); os.chmod(original,0o600); os.chmod(changed,0o600)
+        digest=sha256_file(original)
+        with open_verified_file(original,64,digest) as original_fd:
+            _copy_fd_to_remote(ns.rclone,original_fd,remote_object)
+        immutable_refused=False
+        with open_verified_file(changed,64) as changed_fd:
+            for _ in range(3):
+                refusal=_run_copy_fd_to_remote(ns.rclone,changed_fd,remote_object)
+                if refusal.returncode==0: raise SafetyError("immutable overwrite unexpectedly succeeded")
+                if "immutable file modified" in refusal.stderr.lower():
+                    immutable_refused=True; break
+        if not immutable_refused: raise SafetyError("immutable overwrite refusal was not proven")
+        with _download_to_fd(ns.rclone,remote_object,stage) as fetched_fd:
+            if sha256_fd(fetched_fd,64)!=digest: raise SafetyError("canary readback mismatch")
+        rollback_id=str(uuid.uuid4()); rollback=root/"canary-rollback"/rollback_id
+        manifest=_capture(ns.ludusavi,rollback,ns.name,rollback_id,None,host["id"],"enrollment",ns.registry_portability_proven)
+        atomic_json(rollback/"manifest.json",manifest)
+        if not _compare(ns.ludusavi,rollback/"payload-root",ns.name,ns.registry_portability_proven): raise SafetyError("canary rollback does not match live state")
+        journal={"schema":1,"protocol":PROTOCOL,"game":ns.name,"gameKey":game_key(ns.name),"remote":ns.remote,"hostIdentity":host,
+                 "canaryObject":remote_object,"canarySha256":digest,"rollbackGeneration":rollback_id,"rollbackBackupId":manifest["payload"]["backupId"],
+                 "rollbackSha256":manifest["payload"]["sha256"],"registryPortabilityProven":ns.registry_portability_proven,"phase":"prepared"}
+        atomic_json(root/"canary-restore.json",journal)
+    evidence=_resume_canary(root,ns,journal)
+    print(json.dumps({"status":"canary-proven","evidence":str(root/"canary.json"),"object":evidence["canaryObject"]}))
+
+
+def validate_enrollment(e:Mapping[str,Any],game:str)->dict[str,Any]:
+    fields={"schema","game","gameKey","protocol","remote","remoteRoot","currentGeneration","helperVersion","canaryEvidence","registryPortabilityProven"}
+    if set(e)!=fields or e.get("schema")!=1 or e.get("game")!=game or e.get("gameKey")!=game_key(game) or e.get("protocol")!=PROTOCOL or e.get("remoteRoot")!=REMOTE_ROOT or e.get("helperVersion")!=HELPER_VERSION: raise SafetyError("invalid enrollment")
+    canonical_uuid(e["currentGeneration"])
+    evidence=e["canaryEvidence"]
+    _validate_canary(evidence,e["remote"],game,fresh=False)
+    if type(e["registryPortabilityProven"]) is not bool: raise SafetyError("invalid enrollment flags")
+    remote_generation(e["remote"],e["gameKey"],e["currentGeneration"])
+    return dict(e)
+
+def validate_session(raw:Mapping[str,Any], key:str, current:str) -> dict[str,Any]:
+    fields={"schema","gameKey","baseGeneration","phase","pendingGeneration","childPid","updatedUtc"}
+    if not isinstance(raw,Mapping) or set(raw)!=fields or raw.get("schema")!=1 or raw.get("gameKey")!=key: raise SafetyError("invalid session journal")
+    base=canonical_uuid(raw["baseGeneration"]); phase=raw.get("phase"); pending=raw.get("pendingGeneration"); pid=raw.get("childPid")
+    if phase not in {"preparing","running","capturing","publishing"}: raise SafetyError("invalid session phase")
+    if pending is not None: canonical_uuid(pending)
+    if pid is not None and (type(pid) is not int or pid<=0): raise SafetyError("invalid session child pid")
+    valid=((phase=="preparing" and pending is None and pid is None) or
+           (phase=="running" and pending is None and pid is not None) or
+           (phase=="capturing" and pending is not None and pid is not None) or
+           (phase=="publishing" and pending is not None))
+    if not valid: raise SafetyError("inconsistent session phase")
+    if base!=current and not (phase=="publishing" and pending==current): raise SafetyError("session base disagrees with enrollment")
+    utc_timestamp(raw["updatedUtc"]); return dict(raw)
+
+def _durable_unlink(path: Path) -> None:
+    path.unlink()
+    fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def write_session(root:Path,key:str,base:str,phase:str,pending:str|None,child_pid:int|None,*,fail_at=None):
+    if phase not in {"preparing","running","capturing","publishing"}: raise SafetyError("invalid session phase")
+    if pending is not None: canonical_uuid(pending)
+    atomic_json(root/"session.json",{"schema":1,"gameKey":key,"baseGeneration":canonical_uuid(base),"phase":phase,"pendingGeneration":pending,"childPid":child_pid,"updatedUtc":dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z")},fail_at=fail_at)
+def write_restore_journal(root:Path,source:str,target:str,phase:str,*,fail_at=None):
+    if phase not in {"restore-prepared","restore-applied","restore-verified"}: raise SafetyError("invalid restore phase")
+    atomic_json(root/"restore.json",{"schema":1,"fromGeneration":canonical_uuid(source),"toGeneration":canonical_uuid(target),"phase":phase},fail_at=fail_at)
+
+def supervise(child:Sequence[str], restore, backup) -> tuple[int,bool]:
+    """Run independently supervised restore, child and backup; preserve child status."""
+    if not restore(): raise SafetyError("restore failed")
+    p=subprocess.run(list(child),check=False,shell=False)
+    backed=bool(backup())
+    return p.returncode,backed
+
+def _api(result: CommandResult) -> dict[str, Any]:
+    if result.returncode != 0:
+        raise SafetyError("ludusavi command failed")
+    try:
+        value = json.loads(result.stdout)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise SafetyError("invalid ludusavi API output") from exc
+    if not isinstance(value, dict):
+        raise SafetyError("invalid ludusavi API output")
+    _api_errors(value.get("errors"))
+    return value
+
+
+def _backup_id(api: Mapping[str, Any], game: str, expected_root: Path | None=None) -> str:
+    if set(api)-{"games","errors","overall","cloud"}: raise SafetyError("unknown backups API field")
+    games=api.get("games")
+    if not isinstance(games,Mapping) or set(games)!={game}: raise SafetyError("wrong backups game")
+    record=games[game]
+    if not isinstance(record,Mapping) or set(record)!={"backupPath","backups"}: raise SafetyError("invalid backups API game")
+    if not isinstance(record["backupPath"],str): raise SafetyError("invalid backup path")
+    if expected_root is not None:
+        reported=Path(record["backupPath"]).resolve(); root=expected_root.resolve()
+        allowed={root, root/game, root/game.replace(":","_")}
+        if reported not in allowed: raise SafetyError("wrong backup path")
+    candidates=record["backups"]
+    if not isinstance(candidates,list) or len(candidates)!=1 or not isinstance(candidates[0],Mapping): raise SafetyError("standalone backup is ambiguous")
+    item=candidates[0]
+    if set(item)-{"name","when","os","comment","locked"} or not {"name","when","locked"}<=set(item): raise SafetyError("unknown backup metadata")
+    ident=item["name"]
+    if not isinstance(ident,str) or not ident or any(ord(c)<32 or ord(c)==127 for c in ident): raise SafetyError("invalid backup id")
+    utc_timestamp(item["when"])
+    if type(item["locked"]) is not bool: raise SafetyError("invalid backup metadata")
+    if "os" in item and item["os"] not in {"windows","linux","mac","other"}: raise SafetyError("invalid backup os")
+    if "comment" in item and not isinstance(item["comment"],str): raise SafetyError("invalid backup comment")
+    return ident
+
+def _executable(value: str, label: str) -> str:
+    path=Path(value)
+    if not path.is_absolute():
+        if label != "child":
+            raise SafetyError(f"unsafe {label} executable")
+        path = (Path.cwd() / path).absolute()
+    if path.is_symlink(): raise SafetyError(f"unsafe {label} executable")
+    try: st=path.stat()
+    except OSError as exc: raise SafetyError(f"unsafe {label} executable") from exc
+    if not stat.S_ISREG(st.st_mode) or st.st_uid not in {0,os.geteuid()} or stat.S_IMODE(st.st_mode)&0o022 or not os.access(path,os.X_OK): raise SafetyError(f"unsafe {label} executable")
+    return str(path)
+
+def _version(exe: str) -> str:
+    result = run_command([exe, "--version"])
+    if result.returncode != 0:
+        raise SafetyError("ludusavi version failed")
+    match = re.search(r"(?:^|\s)(\d+\.\d+(?:\.\d+)?)", result.stdout)
+    if not match:
+        raise SafetyError("invalid ludusavi version")
+    version=match.group(1)
+    if version != "0.31.0": raise SafetyError("unsupported ludusavi version")
+    return version
+
+
+def _remote_exists(exe: str, remote: str) -> None:
+    remote_generation(remote, "0" * 64, str(uuid.uuid4()))
+    result = run_command([exe, "listremotes"])
+    if result.returncode != 0 or len(result.stdout.encode()) > 1024 * 1024:
+        raise SafetyError("rclone remote lookup failed")
+    lines = result.stdout.splitlines()
+    if lines.count(remote + ":") != 1:
+        raise SafetyError("exact rclone remote unavailable")
+
+
+def _rclone(exe: str, argv: Sequence[str], *, pass_fds: Sequence[int] = (), allow_missing: bool=False) -> CommandResult:
+    forbidden = {"sync", "delete", "deletefile", "move", "moveto", "purge", "rmdirs", "config"}
+    if not argv or argv[0] in forbidden:
+        raise SafetyError("forbidden rclone operation")
+    result = run_command([exe, *argv],pass_fds=pass_fds)
+    if result.returncode == 0:
+        return result
+    if allow_missing and argv[0]=="lsf" and result.returncode==3:
+        return CommandResult(tuple([exe,*argv]), 0, "", result.stderr)
+    raise SafetyError("rclone operation failed")
+
+
+def _fd_path(fd: int) -> str:
+    return f"/proc/self/fd/{fd}"
+
+
+def _copy_fd_to_remote(exe: str, fd: int, destination: str, *, immutable: bool=True) -> CommandResult:
+    os.lseek(fd,0,os.SEEK_SET)
+    argv=["copyto","--copy-links"]+(["--immutable"] if immutable else [])+[_fd_path(fd),destination]
+    return _rclone(exe,argv,pass_fds=(fd,))
+
+
+def _run_copy_fd_to_remote(exe: str, fd: int, destination: str, *, immutable: bool=True) -> CommandResult:
+    os.lseek(fd,0,os.SEEK_SET)
+    argv=[exe,"copyto","--copy-links"]+(["--immutable"] if immutable else [])+[_fd_path(fd),destination]
+    return run_command(argv,pass_fds=(fd,))
+
+
+@contextlib.contextmanager
+def _download_to_fd(exe: str, source: str, directory: Path, *, attempts: int=1):
+    """Fetch into a named private temp file. rclone 1.75.0 copyto treats dest
+    /proc/self/fd/N as directory /proc/self/fd plus object N and size-checks
+    that /proc node as 64 bytes, so a 64-byte canary passes and payload.tar
+    fails closed after publish."""
+    _private_dir(directory); fd,name=tempfile.mkstemp(prefix=".download-",dir=directory)
+    try:
+        os.fchmod(fd,0o600); last=None
+        for _ in range(attempts):
+            os.ftruncate(fd,0); os.lseek(fd,0,os.SEEK_SET)
+            last=run_command([exe,"copyto","--inplace",source,name])
+            if last.returncode==0: break
+        if last is None or last.returncode!=0: raise SafetyError("rclone operation failed")
+        opened=os.fstat(fd)
+        if opened.st_uid!=os.geteuid() or stat.S_IMODE(opened.st_mode)!=0o600: raise SafetyError("unsafe download dest")
+        os.unlink(name); os.lseek(fd,0,os.SEEK_SET); yield fd
+    finally:
+        os.close(fd)
+        try: os.unlink(name)
+        except FileNotFoundError: pass
+
+
+def _remote_base(remote: str, key: str) -> str:
+    if not HEX_RE.fullmatch(key):
+        raise SafetyError("invalid game key")
+    # Validate the remote name without inventing a generation.
+    if not remote or ":" in remote or "/" in remote or any(ord(c)<32 or ord(c)==127 for c in remote):
+        raise SafetyError("invalid remote name")
+    return f"{remote}:{REMOTE_ROOT}/games/{key}/generations"
+
+
+def _canonical_tar(source: Path, archive: Path) -> None:
+    """Archive an fd-anchored stable tree; reject links and concurrent mutation."""
+    flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
+    rootfd=os.open(source,flags)
+    count=0; total=0
+    try:
+        with tarfile.open(archive,"w",format=tarfile.PAX_FORMAT) as tf:
+            def walk(fd:int,prefix:str) -> None:
+                nonlocal count,total
+                before=os.fstat(fd)
+                for name in sorted(os.listdir(fd)):
+                    if not name or "/" in name or name in {".",".."}: raise SafetyError("unsafe payload member")
+                    st=os.stat(name,dir_fd=fd,follow_symlinks=False); count+=1
+                    if count>MAX_MEMBERS: raise SafetyError("too many payload members")
+                    rel=f"{prefix}{name}"
+                    info=tarfile.TarInfo(rel); info.uid=info.gid=0; info.uname=info.gname=""; info.mtime=0
+                    if stat.S_ISDIR(st.st_mode):
+                        child=os.open(name,flags,dir_fd=fd)
+                        try:
+                            now=os.fstat(child)
+                            if (now.st_dev,now.st_ino)!=(st.st_dev,st.st_ino): raise SafetyError("payload changed during capture")
+                            info.type=tarfile.DIRTYPE; info.name+="/"; info.mode=0o700; tf.addfile(info); walk(child,rel+"/")
+                        finally: os.close(child)
+                    elif stat.S_ISREG(st.st_mode):
+                        f=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
+                        try:
+                            opened=os.fstat(f)
+                            if (opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns)!=(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns): raise SafetyError("payload changed during capture")
+                            total+=opened.st_size
+                            if total>MAX_EXPANDED_BYTES: raise SafetyError("payload expansion limit")
+                            info.mode=0o600; info.size=opened.st_size
+                            with os.fdopen(os.dup(f),"rb") as stream: tf.addfile(info,stream)
+                            after=os.fstat(f)
+                            if (after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=(opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns): raise SafetyError("payload changed during capture")
+                        finally: os.close(f)
+                    else: raise SafetyError("unsafe payload member")
+                after=os.fstat(fd)
+                if (before.st_mtime_ns,before.st_ctime_ns)!=(after.st_mtime_ns,after.st_ctime_ns): raise SafetyError("payload changed during capture")
+            walk(rootfd,"")
+    finally: os.close(rootfd)
+    os.chmod(archive,0o600)
+    if archive.stat().st_size>MAX_PAYLOAD_BYTES: raise SafetyError("payload too large")
+
+
+def _manifest(game: str, ident: str, parent: str | None, creator: str, reason: str,
+              archive: Path, version: str, backup_id: str) -> dict[str, Any]:
+    value = {"schema": SCHEMA, "protocol": PROTOCOL,
+             "game": {"canonicalName": game, "keySha256": game_key(game)},
+             "generation": {"id": ident, "parent": parent,
+                 "createdUtc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                 "creatorHostId": creator, "reason": reason},
+             "payload": {"object": "payload.tar", "bytes": archive.stat().st_size,
+                 "sha256": sha256_file(archive), "format": "tar",
+                 "ludusaviVersion": version, "backupId": backup_id}}
+    return validate_manifest(value, ident, game)
+
+
+def _generation_objects(rclone: str, remote: str, key: str, ident: str) -> set[str]:
+    result=_rclone(rclone,["lsf",remote_generation(remote,key,ident),"--files-only"],allow_missing=True)
+    if len(result.stdout.encode())>4096: raise SafetyError("generation inventory too large")
+    names=result.stdout.splitlines()
+    if len(names)!=len(set(names)) or any(name not in {"payload.tar","manifest.json"} for name in names):
+        raise SafetyError("unexpected generation object")
+    objects=set(names)
+    if "manifest.json" in objects and "payload.tar" not in objects: raise SafetyError("manifest without payload")
+    return objects
+
+
+def _publish(rclone: str, remote: str, key: str, pending: Path,
+             manifest: Mapping[str, Any]) -> None:
+    ident=manifest["generation"]["id"]; validated=validate_manifest(manifest,ident,manifest["game"]["canonicalName"])
+    base=remote_generation(remote,key,ident); archive=pending/"payload.tar"; manifest_path=pending/"manifest.json"
+    local=load_json(manifest_path)
+    if local!=validated: raise SafetyError("durable manifest mismatch")
+    canonical=(json.dumps(validated,sort_keys=True,separators=(",",":"))+"\n").encode()
+    canonical_hash=hashlib.sha256(canonical).hexdigest()
+    with open_verified_file(manifest_path,len(canonical),canonical_hash,maximum=1024*1024) as manifest_fd, \
+         open_verified_file(archive,validated["payload"]["bytes"],validated["payload"]["sha256"]) as archive_fd:
+        objects=_generation_objects(rclone,remote,key,ident)
+        if "payload.tar" not in objects:
+            _copy_fd_to_remote(rclone,archive_fd,base+"/payload.tar"); objects.add("payload.tar")
+        with _download_to_fd(rclone,base+"/payload.tar",pending) as payload_fd:
+            if sha256_fd(payload_fd,validated["payload"]["bytes"])!=validated["payload"]["sha256"]:
+                raise SafetyError("payload readback mismatch")
+        if "manifest.json" not in objects:
+            _copy_fd_to_remote(rclone,manifest_fd,base+"/manifest.json")
+        with _download_to_fd(rclone,base+"/manifest.json",pending) as readback_fd:
+            if _read_fd(readback_fd,1024*1024)!=canonical: raise SafetyError("manifest readback mismatch")
+
+
+def _list_manifests(rclone: str, remote: str, key: str, stage: Path, game: str) -> dict[str, dict[str, Any]]:
+    result=_rclone(rclone,["lsf",_remote_base(remote,key),"--recursive","--files-only"],allow_missing=True)
+    if len(result.stdout.encode())>1024*1024: raise SafetyError("remote inventory too large")
+    raw_names=result.stdout.splitlines()
+    if len(raw_names)>10000: raise SafetyError("remote inventory too large")
+    groups:dict[str,list[str]]={}
+    for raw in raw_names:
+        parts=PurePosixPath(raw).parts
+        if len(parts)!=2 or not UUID4_RE.fullmatch(parts[0]) or parts[1] not in {"payload.tar","manifest.json"}:
+            raise SafetyError("unexpected lineage object")
+        groups.setdefault(parts[0],[]).append(parts[1])
+    names=[]
+    for ident,objects in groups.items():
+        if len(objects)!=len(set(objects)): raise SafetyError("duplicate lineage object")
+        object_set=set(objects)
+        if "manifest.json" in object_set:
+            if object_set!={"payload.tar","manifest.json"}: raise SafetyError("incomplete committed generation")
+            names.append(ident)
+        elif object_set!={"payload.tar"}: raise SafetyError("invalid pending generation")
+    manifests={}; _private_dir(stage)
+    for ident in sorted(names):
+        source=remote_generation(remote,key,ident)+"/manifest.json"
+        try:
+            with _download_to_fd(rclone,source,stage,attempts=3) as manifest_fd:
+                manifests[ident]=validate_manifest(load_json_untrusted_fd(manifest_fd),ident,game)
+        except SafetyError as exc:
+            raise SafetyError("committed manifest fetch failed") from exc
+    return manifests
+
+
+def load_json_untrusted_fd(fd: int) -> dict[str, Any]:
+    try: value=json.loads(_read_fd(fd,1024*1024).decode("utf-8"))
+    except (OSError,UnicodeError,json.JSONDecodeError) as exc: raise SafetyError("malformed committed manifest") from exc
+    if not isinstance(value,dict): raise SafetyError("malformed committed manifest")
+    return value
+
+
+def load_json_untrusted(path: Path) -> dict[str, Any]:
+    try:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+        try: return load_json_untrusted_fd(fd)
+        finally: os.close(fd)
+    except OSError as exc: raise SafetyError("malformed committed manifest") from exc
+
+
+def _fetch_generation(rclone: str, remote: str, key: str, manifest: Mapping[str, Any], stage: Path, game: str) -> Path:
+    if stage.exists():
+        if stage.is_symlink() or not stage.is_dir(): raise SafetyError("unsafe generation stage")
+        shutil.rmtree(stage)
+    _private_dir(stage)
+    ident=manifest["generation"]["id"]; pay=manifest["payload"]
+    root=stage/"payload-root"
+    with _download_to_fd(rclone,remote_generation(remote,key,ident)+"/payload.tar",stage) as archive_fd:
+        if sha256_fd(archive_fd,pay["bytes"])!=pay["sha256"]: raise SafetyError("payload hash mismatch")
+        before=os.fstat(archive_fd); safe_extract_tar_fd(archive_fd,root); after=os.fstat(archive_fd)
+        if (after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=(before.st_size,before.st_mtime_ns,before.st_ctime_ns):
+            raise SafetyError("payload changed during extraction")
+        if sha256_fd(archive_fd,pay["bytes"])!=pay["sha256"]: raise SafetyError("payload changed during extraction")
+    return root
+
+
+def _backups_id(ludusavi: str, root: Path, game: str) -> str:
+    return _backup_id(_api(run_command([ludusavi, "--no-manifest-update", "backups", "--path", str(root), "--api", game])), game, root)
+
+
+def _compare(ludusavi: str, root: Path, game: str, registry: bool) -> bool:
+    try: require_exact_same(_api(run_command(ludusavi_compare_argv(ludusavi, root, game))), game, registry_portability_proven=registry)
+    except LiveStateDiffers:
+        return False
+    return True
+
+
+def _require_live_matches(ludusavi: str, root: Path, game: str, registry: bool, *, reason: str) -> None:
+    """Refuse restore if live saves no longer match the expected generation."""
+    if not _compare(ludusavi, root, game, registry):
+        raise SafetyError(reason)
+
+
+def _capture(ludusavi: str, pending: Path, game: str, ident: str, parent: str | None,
+             creator: str, reason: str, registry_portability_proven: bool) -> dict[str, Any]:
+    _private_dir(pending); payload = pending / "payload-root"; _private_dir(payload)
+    backup_api=_api(run_command(ludusavi_backup_argv(ludusavi, payload, game)))
+    _validate_operative(backup_api,game,exact_same=False,registry_portability_proven=registry_portability_proven)
+    backup_id = _backups_id(ludusavi, payload, game)
+    if not _compare(ludusavi,payload,game,registry_portability_proven): raise SafetyError("standalone backup does not match live state")
+    archive = pending / "payload.tar"; _canonical_tar(payload, archive)
+    return _manifest(game, ident, parent, creator, reason, archive, _version(ludusavi), backup_id)
+
+
+def _enrollment(game: str, remote: str, ident: str, evidence: Mapping[str,Any], registry: bool) -> dict[str, Any]:
+    return {"schema":1,"game":game,"gameKey":game_key(game),"protocol":PROTOCOL,"remote":remote,"remoteRoot":REMOTE_ROOT,"currentGeneration":ident,"helperVersion":HELPER_VERSION,"canaryEvidence":dict(evidence),"registryPortabilityProven":registry}
+
+
+def _import_journal(root: Path) -> dict[str,Any] | None:
+    path=root/"import-restore.json"
+    if not path.exists(): return None
+    raw=load_json(path)
+    fields={"schema","game","gameKey","remote","targetGeneration","phase","rollbackGeneration","rollbackBackupId","rollbackSha256","canaryEvidence","registryPortabilityProven"}
+    if set(raw)!=fields or raw.get("schema")!=1 or raw.get("phase") not in {"prepared","applied","verified"}: raise SafetyError("invalid import restore journal")
+    canonical_uuid(raw["targetGeneration"]); rollback=canonical_uuid(raw["rollbackGeneration"])
+    if not isinstance(raw["rollbackBackupId"],str) or not raw["rollbackBackupId"] or not HEX_RE.fullmatch(raw["rollbackSha256"]): raise SafetyError("invalid import rollback")
+    if type(raw["registryPortabilityProven"]) is not bool: raise SafetyError("invalid import journal")
+    expected=root/"import-rollback"/rollback/"payload.tar"
+    if sha256_file(expected)!=raw["rollbackSha256"]: raise SafetyError("import rollback backup invalid")
+    _validate_canary(raw["canaryEvidence"],raw["remote"],raw["game"],fresh=False)
+    return raw
+
+def _write_import_journal(root:Path,value:Mapping[str,Any],phase:str) -> None:
+    updated=dict(value); updated["phase"]=phase; atomic_json(root/"import-restore.json",updated)
+
+def _selected_import(ns: argparse.Namespace) -> str | None:
+    return getattr(ns, "import_generation", None) or getattr(ns, "import_root", None)
+
+
+def _require_importable(observed: Mapping[str, Mapping[str, Any]], ident: str, game: str, *, root_only: bool) -> None:
+    if ident not in observed: raise SafetyError("selected import is not committed")
+    if len([m for m in observed.values() if m["generation"]["parent"] is None]) != 1:
+        raise DivergenceError("remote has competing roots")
+    if root_only and observed[ident]["generation"]["parent"] is not None:
+        raise SafetyError("selected import is not a committed root")
+    classify_lineage(observed, ident, game)
+
+
+def enroll(ns: argparse.Namespace) -> None:
+    game=ns.name; root=state_root(game); _private_dir(root); host=_host_identity(); journal=_import_journal(root)
+    enrollment_path=root/"enrollment.json"
+    if enrollment_path.exists():
+        existing=validate_enrollment(load_json(enrollment_path),game)
+        if journal and existing["currentGeneration"]==journal["targetGeneration"]:
+            _durable_unlink(root/"import-restore.json"); print(json.dumps({"status":"enrolled","gameKey":game_key(game),"generation":existing["currentGeneration"]})); return
+        raise SafetyError("already enrolled")
+    evidence=_canary(Path(ns.canary_evidence),ns.remote,game)
+    _remote_exists(ns.rclone,ns.remote)
+    with tempfile.TemporaryDirectory(prefix="enroll-",dir=root) as tmp:
+        stage=Path(tmp); observed=_list_manifests(ns.rclone,ns.remote,game_key(game),stage/"metadata",game)
+        selected=_selected_import(ns)
+        if journal:
+            if selected!=journal["targetGeneration"] or journal["game"]!=game or journal["gameKey"]!=game_key(game) or journal["remote"]!=ns.remote or journal["canaryEvidence"]!=evidence or journal["registryPortabilityProven"]!=ns.registry_portability_proven:
+                raise SafetyError("import journal invocation mismatch")
+            ident=journal["targetGeneration"]
+            if ident not in observed: raise SafetyError("import target no longer committed")
+            payload=_fetch_generation(ns.rclone,ns.remote,game_key(game),observed[ident],stage/"import-recovery",game)
+            target_backup=_backups_id(ns.ludusavi,payload,game)
+            if target_backup!=observed[ident]["payload"]["backupId"]: raise SafetyError("import target backup id mismatch")
+            if not _compare(ns.ludusavi,payload,game,ns.registry_portability_proven):
+                rollback=root/"import-rollback"/journal["rollbackGeneration"]/"payload-root"
+                if _backups_id(ns.ludusavi,rollback,game)!=journal["rollbackBackupId"]: raise SafetyError("import rollback backup id mismatch")
+                if not _compare(ns.ludusavi,rollback,game,ns.registry_portability_proven):
+                    raise SafetyError("live state matches neither import target nor rollback; rollback and journal preserved")
+                preview=_api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,target_backup,game,preview=True)))
+                validate_restore_preview(preview,game,registry_portability_proven=ns.registry_portability_proven)
+                _require_live_matches(ns.ludusavi,rollback,game,ns.registry_portability_proven,reason="live state changed before import restore")
+                _api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,target_backup,game)))
+                _write_import_journal(root,journal,"applied")
+                require_exact_same(_api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,target_backup,game,preview=True))),game,registry_portability_proven=ns.registry_portability_proven)
+                _write_import_journal(root,journal,"verified")
+            atomic_json(enrollment_path,_enrollment(game,ns.remote,ident,evidence,ns.registry_portability_proven))
+            _durable_unlink(root/"import-restore.json")
+        elif selected:
+            ident=selected
+            _require_importable(observed,ident,game,root_only=bool(ns.import_root))
+            payload=_fetch_generation(ns.rclone,ns.remote,game_key(game),observed[ident],stage/"import",game)
+            backup_id=_backups_id(ns.ludusavi,payload,game)
+            if backup_id!=observed[ident]["payload"]["backupId"]: raise SafetyError("import backup id mismatch")
+            preview=_api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,backup_id,game,preview=True)))
+            validate_restore_preview(preview,game,registry_portability_proven=ns.registry_portability_proven)
+            rollback_id=str(uuid.uuid4()); rollback=root/"import-rollback"/rollback_id
+            rollback_manifest=_capture(ns.ludusavi,rollback,game,rollback_id,None,host["id"],"enrollment",ns.registry_portability_proven)
+            if not _compare(ns.ludusavi,rollback/"payload-root",game,ns.registry_portability_proven): raise SafetyError("rollback backup does not match live state")
+            j={"schema":1,"game":game,"gameKey":game_key(game),"remote":ns.remote,"targetGeneration":ident,"phase":"prepared",
+               "rollbackGeneration":rollback_id,"rollbackBackupId":rollback_manifest["payload"]["backupId"],"rollbackSha256":rollback_manifest["payload"]["sha256"],
+               "canaryEvidence":dict(evidence),"registryPortabilityProven":ns.registry_portability_proven}
+            _write_import_journal(root,j,"prepared")
+            _require_live_matches(ns.ludusavi,rollback/"payload-root",game,ns.registry_portability_proven,reason="live state changed before import restore")
+            _api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,backup_id,game)))
+            _write_import_journal(root,j,"applied")
+            require_exact_same(_api(run_command(ludusavi_restore_argv(ns.ludusavi,payload,backup_id,game,preview=True))),game,registry_portability_proven=ns.registry_portability_proven)
+            _write_import_journal(root,j,"verified")
+            atomic_json(enrollment_path,_enrollment(game,ns.remote,ident,evidence,ns.registry_portability_proven))
+            _durable_unlink(root/"import-restore.json")
+        else:
+            if observed: raise SafetyError("remote lineage exists; select --import-root or --import-generation")
+            ident=str(uuid.uuid4()); pending=stage/ident
+            manifest=_capture(ns.ludusavi,pending,game,ident,None,host["id"],"enrollment",ns.registry_portability_proven)
+            atomic_json(pending/"manifest.json",manifest)
+            _publish(ns.rclone,ns.remote,game_key(game),pending,manifest)
+            payload=_fetch_generation(ns.rclone,ns.remote,game_key(game),manifest,stage/"verify",game)
+            if _backups_id(ns.ludusavi,payload,game)!=manifest["payload"]["backupId"]: raise SafetyError("enrollment readback backup mismatch")
+            atomic_json(enrollment_path,_enrollment(game,ns.remote,ident,evidence,ns.registry_portability_proven))
+    print(json.dumps({"status":"enrolled","gameKey":game_key(game),"generation":ident}))
+
+
+def _set_current(root: Path, enrollment: dict[str, Any], ident: str) -> None:
+    enrollment = dict(enrollment); enrollment["currentGeneration"] = ident
+    atomic_json(root / "enrollment.json", enrollment)
+
+
+def _is_descendant(manifests: Mapping[str,Mapping[str,Any]], source: str, target: str) -> bool:
+    seen=set(); current=target
+    while current!=source:
+        if current in seen or current not in manifests: return False
+        seen.add(current); current=manifests[current]["generation"]["parent"]
+        if current is None: return False
+    return True
+
+def _process_group_exists(pgid: int) -> bool:
+    try: os.killpg(pgid,0)
+    except ProcessLookupError: return False
+    except PermissionError as exc: raise SafetyError("cannot inspect journaled child process group") from exc
+    except OSError as exc: raise SafetyError("cannot inspect journaled child process group") from exc
+    return True
+
+
+def _recover_pending(root: Path, e: dict[str, Any], ludusavi: str, rclone: str, game: str) -> dict[str, Any]:
+    session_path=root/"session.json"
+    if not session_path.exists(): return e
+    session=validate_session(load_json(session_path),e["gameKey"],e["currentGeneration"])
+    if session["phase"] in {"running","capturing"} and _process_group_exists(session["childPid"]):
+        raise SafetyError("journaled game child is still running")
+    pending_id=session["pendingGeneration"]
+    if pending_id is not None:
+        pending=root/"pending"/pending_id; manifest_path=pending/"manifest.json"
+        if not manifest_path.exists():
+            if session["phase"]!="capturing": raise SafetyError("publishing session has no durable manifest")
+            if pending.exists():
+                if pending.is_symlink() or not pending.is_dir(): raise SafetyError("unsafe incomplete pending capture")
+                shutil.rmtree(pending)
+            manifest=_capture(ludusavi,pending,game,pending_id,session["baseGeneration"],_host_identity()["id"],"crash-recovery",e["registryPortabilityProven"])
+            atomic_json(manifest_path,manifest)
+            write_session(root,e["gameKey"],session["baseGeneration"],"publishing",pending_id,None)
+        else:
+            manifest=validate_manifest(load_json(manifest_path),pending_id,game)
+        if manifest["generation"]["parent"]!=session["baseGeneration"]: raise SafetyError("pending manifest ancestry mismatch")
+        _publish(rclone,e["remote"],e["gameKey"],pending,manifest)
+        if e["currentGeneration"]!=pending_id: _set_current(root,e,pending_id)
+        _durable_unlink(session_path)
+        return validate_enrollment(load_json(root/"enrollment.json"),game)
+    return e
+
+
+def _recover_restore(root: Path, e: dict[str, Any], ludusavi: str, rclone: str, game: str) -> dict[str, Any]:
+    journal_path=root/"restore.json"
+    if not journal_path.exists(): return e
+    journal=load_json(journal_path)
+    if set(journal)!={"schema","fromGeneration","toGeneration","phase"} or journal.get("schema")!=1: raise SafetyError("invalid restore journal")
+    source,target=canonical_uuid(journal["fromGeneration"]),canonical_uuid(journal["toGeneration"])
+    if journal["phase"] not in {"restore-prepared","restore-applied","restore-verified"}: raise SafetyError("invalid restore journal")
+    if e["currentGeneration"] not in {source,target}: raise SafetyError("restore journal disagrees with enrollment")
+    manifests=_list_manifests(rclone,e["remote"],e["gameKey"],root/"restore-metadata",game)
+    if source not in manifests or target not in manifests or not _is_descendant(manifests,source,target): raise SafetyError("restore journal ancestry mismatch")
+    target_root=_fetch_generation(rclone,e["remote"],e["gameKey"],manifests[target],root/"restore-target",game)
+    if _compare(ludusavi,target_root,game,e["registryPortabilityProven"]):
+        if e["currentGeneration"]!=target: _set_current(root,e,target)
+        _durable_unlink(journal_path)
+        return validate_enrollment(load_json(root/"enrollment.json"),game)
+    if e["currentGeneration"]==target: raise SafetyError("committed restore no longer matches live state")
+    source_root=_fetch_generation(rclone,e["remote"],e["gameKey"],manifests[source],root/"restore-source",game)
+    if _compare(ludusavi,source_root,game,e["registryPortabilityProven"]):
+        _durable_unlink(journal_path); return e
+    raise SafetyError("live state matches neither restore generation")
+
+
+def _terminate_process_group(child: subprocess.Popen[Any]) -> None:
+    """Terminate and prove quiescence of a child-owned process group."""
+    with contextlib.suppress(ProcessLookupError): os.killpg(child.pid,signal.SIGTERM)
+    deadline=time.monotonic()+TERM_GRACE_SECONDS
+    while time.monotonic()<deadline:
+        child.poll()
+        if not _process_group_exists(child.pid): return
+        time.sleep(0.1)
+    with contextlib.suppress(ProcessLookupError): os.killpg(child.pid,signal.SIGKILL)
+    deadline=time.monotonic()+KILL_GRACE_SECONDS
+    while time.monotonic()<deadline:
+        child.poll()
+        if not _process_group_exists(child.pid): return
+        time.sleep(0.1)
+    raise SafetyError("child process group could not be terminated")
+
+
+def _run_child(argv: Sequence[str], on_started) -> tuple[int,int]:
+    # The launch gate prevents game exec before its process-group ID is durable.
+    # Parent death closes the pipe, so an unjournaled trampoline exits safely.
+    read_fd,write_fd=os.pipe2(os.O_CLOEXEC)
+    gate=("import os,sys; fd=int(sys.argv[1]); token=os.read(fd,1); os.close(fd); "
+          "sys.exit(125) if token!=b'1' else os.execv(sys.argv[2],sys.argv[2:])")
+    try:
+        child=subprocess.Popen([sys.executable,"-c",gate,str(read_fd),*argv],shell=False,start_new_session=True,
+                               stdout=None,stderr=None,pass_fds=(read_fd,))
+    except BaseException:
+        os.close(write_fd)
+        raise
+    finally:
+        os.close(read_fd)
+    try:
+        on_started(child.pid)
+        os.write(write_fd,b"1")
+    except BaseException:
+        with contextlib.suppress(OSError): os.close(write_fd)
+        _terminate_process_group(child)
+        raise
+    else:
+        os.close(write_fd)
+    previous={}
+    def forward(signum, _frame):
+        with contextlib.suppress(ProcessLookupError): os.killpg(child.pid,signum)
+    try:
+        if __import__("threading").current_thread() is __import__("threading").main_thread():
+            for signum in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
+                previous[signum]=signal.signal(signum,forward)
+        status=child.wait()
+        while _process_group_exists(child.pid): time.sleep(0.25)
+        return child.pid,status
+    finally:
+        for signum,handler in previous.items(): signal.signal(signum,handler)
+
+def run_game(ns: argparse.Namespace) -> int:
+    game = ns.name; root = state_root(game); _private_dir(root); e = validate_enrollment(load_json(root / "enrollment.json"), game)
+    _remote_exists(ns.rclone, e["remote"])
+    session_path=root/"session.json"; resuming_publication=False
+    if session_path.exists():
+        prior=validate_session(load_json(session_path),e["gameKey"],e["currentGeneration"])
+        resuming_publication=prior["pendingGeneration"] is not None
+    e = _recover_pending(root, e, ns.ludusavi, ns.rclone, game)
+    if resuming_publication and not session_path.exists():
+        print(json.dumps({"status":"recovered-publication","generation":e["currentGeneration"]}))
+        return 0
+    e = _recover_restore(root, e, ns.ludusavi, ns.rclone, game)
+    # A stale running/capturing marker means live data may have changed. Preserve it first.
+    session_path = root / "session.json"
+    if session_path.exists():
+        old = validate_session(load_json(session_path),e["gameKey"],e["currentGeneration"]); base = old["baseGeneration"]
+        graph = _list_manifests(ns.rclone, e["remote"], e["gameKey"], root / "recovery-metadata", game)
+        if base not in graph: raise SafetyError("session base absent remotely")
+        base_root = _fetch_generation(ns.rclone, e["remote"], e["gameKey"], graph[base], root / "recovery-base", game)
+        if not _compare(ns.ludusavi, base_root, game, e["registryPortabilityProven"]):
+            ident = str(uuid.uuid4()); pending = root / "pending" / ident
+            manifest = _capture(ns.ludusavi, pending, game, ident, base, _host_identity()["id"], "crash-recovery", e["registryPortabilityProven"])
+            atomic_json(pending/"manifest.json",manifest)
+            write_session(root, e["gameKey"], base, "publishing", ident, None)
+            _publish(ns.rclone, e["remote"], e["gameKey"], pending, manifest)
+            _set_current(root, e, ident); _durable_unlink(session_path); e = validate_enrollment(load_json(root / "enrollment.json"), game)
+        else: _durable_unlink(session_path)
+    # Two byte-identical graph observations are required before selecting a restore.
+    graph1 = _list_manifests(ns.rclone, e["remote"], e["gameKey"], root / "metadata-a", game)
+    graph2 = _list_manifests(ns.rclone, e["remote"], e["gameKey"], root / "metadata-b", game)
+    if json.dumps(graph1, sort_keys=True) != json.dumps(graph2, sort_keys=True): raise SafetyError("remote graph changed")
+    candidate = classify_lineage(graph2, e["currentGeneration"], game)
+    base_manifest = graph2[e["currentGeneration"]]
+    base_root = _fetch_generation(ns.rclone, e["remote"], e["gameKey"], base_manifest, root / "base", game)
+    if candidate and not _compare(ns.ludusavi, base_root, game, e["registryPortabilityProven"]):
+        raise SafetyError("live state changed before restore")
+    if candidate:
+        selected = graph2[candidate]; selected_root = _fetch_generation(ns.rclone, e["remote"], e["gameKey"], selected, root / "selected", game)
+        if _backups_id(ns.ludusavi, selected_root, game) != selected["payload"]["backupId"]: raise SafetyError("selected backup id mismatch")
+        # Final observation immediately precedes mutation.
+        graph3 = _list_manifests(ns.rclone, e["remote"], e["gameKey"], root / "metadata-c", game)
+        if json.dumps(graph2, sort_keys=True) != json.dumps(graph3, sort_keys=True): raise SafetyError("remote graph changed before restore")
+        preview = _api(run_command(ludusavi_restore_argv(ns.ludusavi, selected_root, selected["payload"]["backupId"], game, preview=True)))
+        validate_restore_preview(preview,game,registry_portability_proven=e["registryPortabilityProven"])
+        write_restore_journal(root, e["currentGeneration"], candidate, "restore-prepared")
+        _require_live_matches(ns.ludusavi, base_root, game, e["registryPortabilityProven"], reason="live state changed before restore")
+        _api(run_command(ludusavi_restore_argv(ns.ludusavi, selected_root, selected["payload"]["backupId"], game)))
+        write_restore_journal(root, e["currentGeneration"], candidate, "restore-applied")
+        require_exact_same(_api(run_command(ludusavi_restore_argv(ns.ludusavi, selected_root, selected["payload"]["backupId"], game, preview=True))), game, registry_portability_proven=e["registryPortabilityProven"])
+        write_restore_journal(root, e["currentGeneration"], candidate, "restore-verified")
+        _set_current(root, e, candidate); _durable_unlink(root / "restore.json"); e = validate_enrollment(load_json(root / "enrollment.json"), game)
+    write_session(root, e["gameKey"], e["currentGeneration"], "preparing", None, None)
+    child_pid,child_status = _run_child(ns.child,lambda pid: write_session(root,e["gameKey"],e["currentGeneration"],"running",None,pid))
+    ident = str(uuid.uuid4()); pending = root / "pending" / ident
+    write_session(root, e["gameKey"], e["currentGeneration"], "capturing", ident, child_pid)
+    manifest = _capture(ns.ludusavi, pending, game, ident, e["currentGeneration"], _host_identity()["id"], "normal-exit", e["registryPortabilityProven"])
+    atomic_json(pending / "manifest.json", manifest)
+    write_session(root, e["gameKey"], e["currentGeneration"], "publishing", ident, child_pid)
+    _publish(ns.rclone, e["remote"], e["gameKey"], pending, manifest)
+    _set_current(root, e, ident); _durable_unlink(session_path)
+    print(json.dumps({"status": "protected", "generation": ident, "childExit": child_status}))
+    return child_status
+
+
+def parse_args(argv: Sequence[str]):
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="mode", required=True)
+    status = sub.add_parser("status"); status.add_argument("--name", required=True)
+    canary_p=sub.add_parser("canary"); canary_p.add_argument("--name",required=True)
+    canary_p.add_argument("--ludusavi",required=True); canary_p.add_argument("--rclone",required=True); canary_p.add_argument("--remote",required=True)
+    canary_p.add_argument("--registry-portability-proven",action="store_true")
+    enroll_p = sub.add_parser("enroll"); enroll_p.add_argument("--name", required=True)
+    enroll_p.add_argument("--ludusavi", required=True); enroll_p.add_argument("--rclone", required=True)
+    enroll_p.add_argument("--remote", required=True)
+    enroll_p.add_argument("--canary-evidence", required=True)
+    enroll_p.add_argument("--registry-portability-proven", action="store_true")
+    roots = enroll_p.add_mutually_exclusive_group(required=True)
+    roots.add_argument("--capture-new", action="store_true")
+    roots.add_argument("--import-root")
+    roots.add_argument("--import-generation")
+    run_p = sub.add_parser("run"); run_p.add_argument("--name", required=True)
+    run_p.add_argument("--ludusavi", required=True); run_p.add_argument("--rclone", required=True)
+    run_p.add_argument("child", nargs=argparse.REMAINDER)
+    try: ns = p.parse_args(argv)
+    except SystemExit: raise
+    validate_game(ns.name)
+    if getattr(ns, "import_root", None): canonical_uuid(ns.import_root)
+    if getattr(ns, "import_generation", None): canonical_uuid(ns.import_generation)
+    if ns.mode == "run":
+        if not ns.child or ns.child[0] != "--" or len(ns.child) == 1: raise UsageError("run requires child after --")
+        ns.child = ns.child[1:]
+    return ns
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        if os.geteuid()==0: raise SafetyError("refusing to run as root")
+        ns = parse_args(sys.argv[1:] if argv is None else argv)
+        if ns.mode == "status":
+            root=state_root(ns.name); _private_dir(root); e = validate_enrollment(load_json(root / "enrollment.json"), ns.name)
+            print(json.dumps({"enrolled": True, "gameKey": e["gameKey"], "generation": e["currentGeneration"]}))
+            return 0
+        if ns.mode in {"canary","enroll","run"}:
+            ns.ludusavi=_executable(ns.ludusavi,"ludusavi"); ns.rclone=_executable(ns.rclone,"rclone"); _version(ns.ludusavi)
+            if ns.mode=="run": ns.child[0]=_executable(ns.child[0],"child")
+        with game_lock(ns.name):
+            if ns.mode == "canary": perform_canary(ns); return 0
+            if ns.mode == "enroll": enroll(ns); return 0
+            return run_game(ns)
+    except SystemExit as exc: return 0 if exc.code == 0 else 64
+    except LockBusy as exc: print(str(exc), file=sys.stderr); return 75
+    except UsageError as exc: print(str(exc), file=sys.stderr); return 64
+    except (SafetyError, OSError) as exc: print(str(exc), file=sys.stderr); return 70
+
+
+if __name__ == "__main__":
+    status=main()
+    if status<0:
+        signum=-status
+        signal.signal(signum,signal.SIG_DFL)
+        os.kill(os.getpid(),signum)
+    raise SystemExit(status)

@@ -1,0 +1,14 @@
+# Example host file for a public/local operator.
+# Point GAME_LIBRARY_HOSTS at a copy of this file.
+# Omit `ssh` or set it to `local` to run on this machine.
+
+hosts:
+  - name: example
+    user: alice
+    ssh: example-games
+    xdg_config_home: /home/alice/.config
+    xdg_data_home: /home/alice/.local/share
+    xdg_state_home: /home/alice/.local/state
+    xdg_cache_home: /home/alice/.cache
+    game_library_root: /home/alice/.local/share/games
+    gog_library_root: /home/alice/.local/share/games/gog
