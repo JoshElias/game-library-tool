@@ -37,7 +37,8 @@ export GAME_LIBRARY_REGISTRY=$PWD/registry/games
 ```
 
 Without a hosts file, `hosts` / `doctor` operate on the current machine
-only (`ssh` alias `local`).
+only (`ssh` alias `local`). A file at
+`~/.config/game-library/hosts.yaml` is picked up automatically.
 
 Install the lineage helper on each endpoint desktop user:
 

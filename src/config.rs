@@ -94,8 +94,13 @@ pub fn resolved() -> ResolvedConfig {
     let hosts_file = std::env::var("GAME_LIBRARY_HOSTS")
         .ok()
         .filter(|value| !value.is_empty())
-        .or_else(|| file.as_ref().and_then(|cfg| cfg.hosts.clone()))
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|cfg| cfg.hosts.clone())
+                .map(PathBuf::from)
+        })
+        .or_else(discover_hosts_file);
     let lineage_remote = std::env::var("GAME_LIBRARY_LINEAGE_REMOTE")
         .ok()
         .filter(|value| !value.is_empty())
@@ -113,4 +118,20 @@ pub fn resolved() -> ResolvedConfig {
         lineage_remote,
         shared_gog_root,
     }
+}
+
+fn discover_hosts_file() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("XDG_CONFIG_HOME")
+        .or_else(|_| std::env::var("HOME").map(|home| format!("{home}/.config")))
+    {
+        candidates.push(PathBuf::from(home).join("game-library/hosts.yaml"));
+    }
+    if let Ok(repo) = std::env::var("GAME_LIBRARY_REPO") {
+        candidates.push(PathBuf::from(repo).join("hosts.yaml"));
+    }
+    let repo = crate::paths::inventory_repo(std::env::current_dir().ok().as_deref());
+    candidates.push(repo.join("hosts.yaml"));
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("hosts.yaml"));
+    candidates.into_iter().find(|path| path.is_file())
 }

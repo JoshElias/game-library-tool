@@ -69,3 +69,26 @@ fn hosts_env_file_is_used() {
         },
     );
 }
+
+#[test]
+fn discovers_xdg_hosts_file() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("game-library");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("hosts.yaml"), EXAMPLE).unwrap();
+    with_locked_env(
+        &[
+            ("GAME_LIBRARY_HOSTS", None),
+            (
+                "GAME_LIBRARY_CONFIG",
+                Some("/tmp/missing-game-library-config.yaml"),
+            ),
+            ("GAME_LIBRARY_REPO", Some("/tmp/missing-game-library-repo")),
+            ("XDG_CONFIG_HOME", Some(tmp.path().to_str().unwrap())),
+        ],
+        || {
+            let hosts = load_hosts().unwrap();
+            assert_eq!(hosts[0].name, "example");
+        },
+    );
+}
