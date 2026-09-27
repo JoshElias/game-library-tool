@@ -62,15 +62,15 @@ mod tests {
 
     #[test]
     fn canonical_xdg_is_not_legacy() {
-        let path = "/home/josh/.local/share/games/gog/coromon";
+        let path = "/home/alice/.local/share/games/gog/coromon";
         assert!(!is_legacy_path(Some(path), Some(path)));
     }
 
     #[test]
     fn home_games_gog_is_legacy() {
         assert!(is_legacy_path(
-            Some("/home/josh/Games/gog/monster-train"),
-            Some("/home/josh/.local/share/games/gog/monster-train"),
+            Some("/home/alice/Games/gog/monster-train"),
+            Some("/home/alice/.local/share/games/gog/monster-train"),
         ));
     }
 
