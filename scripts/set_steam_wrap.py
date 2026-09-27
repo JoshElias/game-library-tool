@@ -32,12 +32,12 @@ def wrap_command(user: str, name: str) -> str:
     )
 
 
-def apply(path: Path, appid: str, command: str) -> str:
+def apply(path: Path, appid: str, command: str) -> str | None:
     text = path.read_text()
     marker = f'"{appid}"\n\t\t\t\t\t{{\n'
     idx = text.find(marker)
     if idx < 0:
-        raise SystemExit(f"no apps block for {appid}")
+        return None
     start = idx + len(marker)
     end = text.find("\n\t\t\t\t\t}", start)
     if end < 0:
@@ -98,7 +98,13 @@ def main() -> int:
     if not configs:
         raise SystemExit("no Steam localconfig.vdf")
     command = wrap_command(args.user, args.name)
-    actions = [apply(path, args.appid, command) for path in configs]
+    actions = [
+        result
+        for path in configs
+        if (result := apply(path, args.appid, command)) is not None
+    ]
+    if not actions:
+        raise SystemExit(f"no apps block for {args.appid}")
     print(actions[0] if len(set(actions)) == 1 else ",".join(actions))
     return 0
 
