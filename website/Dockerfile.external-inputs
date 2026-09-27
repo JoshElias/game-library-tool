@@ -24,5 +24,9 @@ EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS http://127.0.0.1:8787/health || exit 1
 # Inventory, recipes, DB URL file, and any endpoint SSH helper are runtime
 # inputs. There are deliberately no baked host lists or recipe COPY lines.
+ARG SOURCE_REVISION
+ARG SOURCE_URL
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+LABEL org.opencontainers.image.source="${SOURCE_URL}"
 USER 65534:65534
 ENTRYPOINT ["/bin/sh", "/usr/local/bin/game-library-entrypoint"]
